@@ -31,32 +31,51 @@ The plugin is implemented as a custom Neo4j procedure and integrates seamlessly 
 # How it Works : 
 
 clone the repository 
+
 build the package 
+
 you will see condense.0.0.1.jar in the target directory 
+
 add the jar in the directory of /plugin of your Neo4j instance 
+
 modify config.txt of your instance to include the recognize the condense pluging 
 
 dbms.security.procedures.unrestricted=gds.*, condense.* 
+
 dbms.security.procedures.allowlist=gds.*, condense.*
 
 
 create ypur graph in the instance 
 
-1. Project a graph into GDS (required for WCC / Louvain) : 
+1. Project a graph into GDS (required for WCC / Louvain) :
+   
 CALL gds.graph.project(
+
   'myGraph',
+  
   'Person',
+  
   {FOLLOWS: {orientation: 'UNDIRECTED'}}
+  
 );
 
-2. Run the condensation procedure :
+3. Run the condensation procedure :
+   
 CALL condense.run('myGraph', {
+
   candidates: ['stars','wcc','louvain'],
+  
   degreeThreshold: 10,
+  
   write: true
+  
 })
+
 YIELD candidate, mdlScore, superNodes, superEdges, compressionRatio
+
 RETURN *
+
 ORDER BY mdlScore ASC;
 
-3. Compare results 
+
+5. Compare results 
