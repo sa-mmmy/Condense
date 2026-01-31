@@ -47,7 +47,7 @@ dbms.security.procedures.allowlist=gds.*, condense.*
 
 create ypur graph in the instance 
 
-1. Project a graph into GDS (required for WCC / Louvain) :
+## 1. Project a graph into GDS (required for WCC / Louvain) :
    
 CALL gds.graph.project(
 
@@ -59,7 +59,7 @@ CALL gds.graph.project(
   
 );
 
-3. Run the condensation procedure :
+## 2. Run the condensation procedure :
    
 CALL condense.run('myGraph', {
 
@@ -78,4 +78,4 @@ RETURN *
 ORDER BY mdlScore ASC;
 
 
-5. Compare results 
+## 3. Compare results 
