@@ -55,7 +55,6 @@ public class CondenseProc {
 
             try {
                 switch (cand.toLowerCase()) {
-                    case "cliques" -> buildCliques(runId, graphName);
                     case "stars"   -> buildStars(runId, degreeThr);
                     case "wcc"     -> buildWcc(runId, graphName);
                     case "louvain" -> buildLouvain(runId, graphName);
@@ -165,16 +164,19 @@ public class CondenseProc {
         removePropEverywhere(p);
     }
 
-    private void buildKCore(String runId, String graphName, int k) {
+    private void buildKCore(String runId, String graphName, int kIgnored) {
         String p = "c_kc_" + shortId(runId);
-        db.executeTransactionally("CALL gds.kcore.write($g, {writeProperty:$p, k:$k})", Map.of("g",graphName,"p",p,"k",k));
+        db.executeTransactionally(
+                "CALL gds.kcore.write($g, {writeProperty:$p})",
+                Map.of("g", graphName, "p", p)
+        );
         buildSuperNodesFromProperty(runId, "kcore", p);
         createSuperEdges(runId, "kcore");
         removePropEverywhere(p);
     }
 
 
-    private void buildCliques(String runId, String graphName) {
+    /** private void buildCliques(String runId, String graphName) {
         db.executeTransactionally("""
             CALL gds.alpha.maxcliques.stream($g) YIELD nodeIds
             WITH nodeIds, randomUUID() as gid
@@ -186,7 +188,7 @@ public class CondenseProc {
             MERGE (n)-[:IN_SUPER {runId:$r, candidate:'cliques'}]->(s)
             """, Map.of("r", runId, "g", graphName));
         createSuperEdges(runId, "cliques");
-    }
+    }**/
 
     private void buildStars(String runId, long thr) {
         db.executeTransactionally("""
@@ -205,7 +207,7 @@ public class CondenseProc {
     /**
      * Chains: compute degree into a temporary property, then WCC only on degree==2 nodes.
      */
-    private void buildChains(String runId, String graphName) {
+    /** private void buildChains(String runId, String graphName) {
         String degProp = "tmp_deg_" + shortId(runId);
         String compProp = "c_ch_" + shortId(runId);
 
@@ -225,7 +227,42 @@ public class CondenseProc {
 
         removePropEverywhere(compProp);
         removePropEverywhere(degProp);
+    } **/
+
+    private void buildChains(String runId, String graphName) {
+        String degProp  = "tmp_deg_" + shortId(runId);
+        String compProp = "tmp_wcc_" + shortId(runId);
+
+        // 1) Degree
+        db.executeTransactionally(
+                "CALL gds.degree.write($g, {writeProperty:$p})",
+                Map.of("g", graphName, "p", degProp)
+        );
+
+        // 2) WCC on all nodes (no nodeFilter supported in your GDS)
+        db.executeTransactionally(
+                "CALL gds.wcc.write($g, {writeProperty:$p})",
+                Map.of("g", graphName, "p", compProp)
+        );
+
+        // 3) Build chain supernodes from nodes with degree==2, grouped by WCC id
+        String q =
+                "MATCH (n) " +
+                        "WHERE n.`" + degProp + "` = 2 AND n.`" + compProp + "` IS NOT NULL " +
+                        "WITH n.`" + compProp + "` AS gid, collect(n) AS nodes " +
+                        "WHERE size(nodes) > 1 " +
+                        "CREATE (s:SuperNode {runId:$r, candidate:'chains', groupId:toString(gid), size:size(nodes)}) " +
+                        "WITH s, nodes UNWIND nodes AS n " +
+                        "MERGE (n)-[:IN_SUPER {runId:$r, candidate:'chains'}]->(s)";
+        db.executeTransactionally(q, Map.of("r", runId));
+
+        addSingletonsForUncovered(runId, "chains");
+        createSuperEdges(runId, "chains");
+
+        removePropEverywhere(degProp);
+        removePropEverywhere(compProp);
     }
+
 
     // -------- Helpers --------
 
