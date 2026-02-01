@@ -29,7 +29,7 @@ public class CondenseProc {
     }
 
     @Procedure(name = "condense.run", mode = Mode.WRITE)
-    @Description("Génère des résumés (stars, wcc, louvain, chains, kcore), score via MDL, et garde le meilleur.")
+    @Description("Exécute et compare les stratégies de condensation (cliques, stars, wcc, louvain, leiden, lpa, chains, kcore) via un score MDL.")
     public Stream<ResultRow> run(
             @Name("graphName") String graphName,
             @Name(value = "config", defaultValue = "{}") Map<String,Object> config
@@ -37,14 +37,12 @@ public class CondenseProc {
         String runId = UUID.randomUUID().toString();
 
         @SuppressWarnings("unchecked")
-        List<String> candidates = (List<String>) config.getOrDefault(
-                "candidates", Arrays.asList("stars","wcc","louvain","chains","kcore")
-        );
+        List<String> candidates = (List<String>) config.getOrDefault("candidates",
+                Arrays.asList("cliques", "stars", "wcc", "louvain", "leiden", "lpa", "chains", "kcore"));
 
-        long degreeThreshold = ((Number) config.getOrDefault("degreeThreshold", 15)).longValue();
-        int kValue = ((Number) config.getOrDefault("kValue", 3)).intValue(); // Pour K-Core
+        long degreeThr = ((Number) config.getOrDefault("degreeThreshold", 15)).longValue();
+        int kValue = ((Number) config.getOrDefault("kValue", 3)).intValue();
         boolean write = (boolean) config.getOrDefault("write", Boolean.TRUE);
-        boolean dropGraph = (boolean) config.getOrDefault("dropGraph", Boolean.FALSE);
 
         long originalNodes = count("MATCH (n) RETURN count(n) AS c", Map.of());
         long originalEdges = count("MATCH ()-[r]->() RETURN count(r) AS c", Map.of());
@@ -54,167 +52,246 @@ public class CondenseProc {
 
         for (String cand : candidates) {
             cleanupCandidate(runId, cand);
+
             try {
                 switch (cand.toLowerCase()) {
-                    case "stars" -> buildStars(runId, degreeThreshold);
-                    case "wcc"   -> buildWcc(runId, graphName);
+                    case "cliques" -> buildCliques(runId, graphName);
+                    case "stars"   -> buildStars(runId, degreeThr);
+                    case "wcc"     -> buildWcc(runId, graphName);
                     case "louvain" -> buildLouvain(runId, graphName);
-                    case "chains" -> buildChains(runId, graphName);
-                    case "kcore" -> buildKCore(runId, graphName, kValue);
-                    default -> {
-                        log.warn("Candidat inconnu : " + cand);
-                        continue;
-                    }
+                    case "leiden"  -> buildLeiden(runId, graphName);
+                    case "lpa"     -> buildLpa(runId, graphName);
+                    case "chains"  -> buildChains(runId, graphName);
+                    case "kcore"   -> buildKCore(runId, graphName, kValue);
+                    default -> { continue; }
                 }
 
-                long sNodes = count("MATCH (s:SuperNode {runId:$runId, candidate:$cand}) RETURN count(s) AS c", Map.of("runId", runId, "cand", cand));
-                long sEdges = count("MATCH ()-[e:SUPER_EDGE {runId:$runId, candidate:$cand}]->() RETURN count(e) AS c", Map.of("runId", runId, "cand", cand));
+                // Ensure full coverage so error is meaningful across all strategies
+                addSingletonsForUncovered(runId, cand);
 
-                long explainedEdges = count(
-                        "MATCH (a)-[r]->(b) " +
-                                "MATCH (a)-[:IN_SUPER {runId:$runId, candidate:$cand}]->(sa) " +
-                                "MATCH (b)-[:IN_SUPER {runId:$runId, candidate:$cand}]->(sb) " +
-                                "WHERE sa <> sb RETURN count(r) AS c",
-                        Map.of("runId", runId, "cand", cand)
+                long sN = count(
+                        "MATCH (s:SuperNode {runId:$r, candidate:$c}) RETURN count(s) AS c",
+                        Map.of("r",runId,"c",cand)
                 );
 
-                long error = Math.abs(originalEdges - explainedEdges);
-                // Calcul MDL basé sur le document : Coût(Résumé) + Coût(Erreur)
-                double mdlScore = (1.0 * sNodes) + (1.0 * sEdges) + (2.0 * error);
+                long sE = count(
+                        "MATCH ()-[e:SUPER_EDGE {runId:$r, candidate:$c}]->() RETURN count(e) AS c",
+                        Map.of("r",runId,"c",cand)
+                );
 
-                scoreByCand.put(cand, mdlScore);
-                sizeByCand.put(cand, new long[]{sNodes, sEdges});
+                // ---- Fixed MDL accounting ----
+                // coveredEdges: edges whose endpoints are both mapped to *some* supernode
+                long coveredEdges = count(
+                        "MATCH (a)-[rel]->(b) " +
+                                "MATCH (a)-[:IN_SUPER {runId:$r, candidate:$c}]->(sa) " +
+                                "MATCH (b)-[:IN_SUPER {runId:$r, candidate:$c}]->(sb) " +
+                                "RETURN count(rel) AS c",
+                        Map.of("r",runId,"c",cand)
+                );
+
+                // internalEdges: covered edges that become internal to one supernode (sa = sb)
+                long internalEdges = count(
+                        "MATCH (a)-[rel]->(b) " +
+                                "MATCH (a)-[:IN_SUPER {runId:$r, candidate:$c}]->(sa) " +
+                                "MATCH (b)-[:IN_SUPER {runId:$r, candidate:$c}]->(sb) " +
+                                "WHERE sa = sb " +
+                                "RETURN count(rel) AS c",
+                        Map.of("r",runId,"c",cand)
+                );
+
+                // uncovered edges = error
+                long error = Math.max(0, originalEdges - coveredEdges);
+
+                // MDL = model cost + inter-summary cost + cost to encode internal structure + penalty for uncovered edges
+                double score = (1.0 * sN) + (1.0 * sE) + (1.0 * internalEdges) + (2.0 * error);
+
+                scoreByCand.put(cand, score);
+                sizeByCand.put(cand, new long[]{sN, sE});
 
             } catch (Exception ex) {
-                log.error("Échec du candidat : " + cand + " | " + ex.getMessage());
+                log.error("Erreur candidat " + cand + " : " + ex.getMessage(), ex);
                 scoreByCand.put(cand, Double.POSITIVE_INFINITY);
+                sizeByCand.put(cand, new long[]{0,0});
             }
         }
 
-        String best = scoreByCand.entrySet().stream().min(Comparator.comparingDouble(Map.Entry::getValue)).map(Map.Entry::getKey).orElse(null);
-        if (best == null) return Stream.empty();
+        // Best MDL = minimum
+        String best = scoreByCand.entrySet().stream()
+                .min(Comparator.comparingDouble(Map.Entry::getValue))
+                .map(Map.Entry::getKey)
+                .orElse(null);
 
-        if (write) cleanupKeepBest(runId, best);
-        else cleanupKeepBest(runId, "__none__");
-
-        if (dropGraph) safeDropGraph(graphName);
+        if (write && best != null) cleanupKeepBest(runId, best);
 
         return candidates.stream().map(c -> {
             long[] se = sizeByCand.getOrDefault(c, new long[]{0,0});
-            double ratio = (originalNodes + originalEdges) == 0 ? 1.0 : ((double)(se[0] + se[1])) / (double)(originalNodes + originalEdges);
+            double ratio = (originalNodes + originalEdges) == 0 ? 1.0 :
+                    ((double)(se[0] + se[1])) / (double)(originalNodes + originalEdges);
             return new ResultRow(c, scoreByCand.getOrDefault(c, Double.POSITIVE_INFINITY), se[0], se[1], ratio);
         });
     }
 
-    // -------- Nouveaux Builders (Chains & K-Core) --------
+    // -------- Builders (Community Detection & Structures) --------
 
-    private void buildChains(String runId, String graphName) {
-        String prop = "cand_chains_" + shortId(runId);
-        // On utilise WCC mais uniquement sur les nœuds de degré 2 pour isoler les chaînes
-        db.executeTransactionally("""
-            CALL gds.wcc.write($g, {
-                writeProperty: $p,
-                nodeFilter: 'n.degree = 2' 
-            })""", Map.of("g", graphName, "p", prop));
-
-        buildSuperNodesFromProperty(runId, "chains", prop);
-        createSuperEdges(runId, "chains");
-        db.executeTransactionally("MATCH (n) WHERE n[$p] IS NOT NULL REMOVE n[$p]", Map.of("p", prop));
+    private void buildLeiden(String runId, String graphName) {
+        String p = "c_le_" + shortId(runId);
+        db.executeTransactionally("CALL gds.leiden.write($g, {writeProperty: $p})", Map.of("g", graphName, "p", p));
+        buildSuperNodesFromProperty(runId, "leiden", p);
+        createSuperEdges(runId, "leiden");
+        removePropEverywhere(p);
     }
 
-    private void buildKCore(String runId, String graphName, int kValue) {
-        String prop = "cand_kcore_" + shortId(runId);
-        db.executeTransactionally("""
-            CALL gds.kcore.write($g, {
-                writeProperty: $p,
-                k: $k
-            })""", Map.of("g", graphName, "p", prop, "k", kValue));
-
-        buildSuperNodesFromProperty(runId, "kcore", prop);
-        createSuperEdges(runId, "kcore");
-        db.executeTransactionally("MATCH (n) WHERE n[$p] IS NOT NULL REMOVE n[$p]", Map.of("p", prop));
+    private void buildLpa(String runId, String graphName) {
+        String p = "c_lp_" + shortId(runId);
+        db.executeTransactionally("CALL gds.labelPropagation.write($g, {writeProperty: $p})", Map.of("g", graphName, "p", p));
+        buildSuperNodesFromProperty(runId, "lpa", p);
+        createSuperEdges(runId, "lpa");
+        removePropEverywhere(p);
     }
-
-    // -------- Builders Existants --------
 
     private void buildWcc(String runId, String graphName) {
-        String prop = "cand_wcc_" + shortId(runId);
-        db.executeTransactionally("CALL gds.wcc.write($g, {writeProperty: $p})", Map.of("g", graphName, "p", prop));
-        buildSuperNodesFromProperty(runId, "wcc", prop);
+        String p = "c_wc_" + shortId(runId);
+        db.executeTransactionally("CALL gds.wcc.write($g, {writeProperty:$p})", Map.of("g",graphName,"p",p));
+        buildSuperNodesFromProperty(runId, "wcc", p);
         createSuperEdges(runId, "wcc");
-        db.executeTransactionally("MATCH (n) WHERE n[$p] IS NOT NULL REMOVE n[$p]", Map.of("p", prop));
+        removePropEverywhere(p);
     }
 
     private void buildLouvain(String runId, String graphName) {
-        String prop = "cand_louvain_" + shortId(runId);
-        db.executeTransactionally("CALL gds.louvain.write($g, {writeProperty: $p})", Map.of("g", graphName, "p", prop));
-        buildSuperNodesFromProperty(runId, "louvain", prop);
+        String p = "c_lv_" + shortId(runId);
+        db.executeTransactionally("CALL gds.louvain.write($g, {writeProperty:$p})", Map.of("g",graphName,"p",p));
+        buildSuperNodesFromProperty(runId, "louvain", p);
         createSuperEdges(runId, "louvain");
-        db.executeTransactionally("MATCH (n) WHERE n[$p] IS NOT NULL REMOVE n[$p]", Map.of("p", prop));
+        removePropEverywhere(p);
     }
 
-    private void buildStars(String runId, long degreeThreshold) {
+    private void buildKCore(String runId, String graphName, int k) {
+        String p = "c_kc_" + shortId(runId);
+        db.executeTransactionally("CALL gds.kcore.write($g, {writeProperty:$p, k:$k})", Map.of("g",graphName,"p",p,"k",k));
+        buildSuperNodesFromProperty(runId, "kcore", p);
+        createSuperEdges(runId, "kcore");
+        removePropEverywhere(p);
+    }
+
+
+    private void buildCliques(String runId, String graphName) {
+        db.executeTransactionally("""
+            CALL gds.alpha.maxcliques.stream($g) YIELD nodeIds
+            WITH nodeIds, randomUUID() as gid
+            WHERE size(nodeIds) > 2
+            CREATE (s:SuperNode {runId:$r, candidate:'cliques', groupId:toString(gid), size:size(nodeIds)})
+            WITH s, nodeIds
+            UNWIND nodeIds AS nid
+            MATCH (n) WHERE id(n) = nid
+            MERGE (n)-[:IN_SUPER {runId:$r, candidate:'cliques'}]->(s)
+            """, Map.of("r", runId, "g", graphName));
+        createSuperEdges(runId, "cliques");
+    }
+
+    private void buildStars(String runId, long thr) {
         db.executeTransactionally("""
             MATCH (h)
-            WITH h, COUNT { (h)--() } AS deg
-            WHERE deg > $thr
-            CREATE (s:SuperNode {runId:$runId, candidate:'stars', groupId:elementId(h), size:deg+1})
-            MERGE (h)-[:IN_SUPER {runId:$runId, candidate:'stars'}]->(s)
+            WITH h, COUNT {(h)--()} AS d
+            WHERE d > $t
+            CREATE (s:SuperNode {runId:$r, candidate:'stars', groupId:elementId(h), size:d+1})
+            MERGE (h)-[:IN_SUPER {runId:$r, candidate:'stars'}]->(s)
             WITH h, s
             MATCH (h)--(n)
-            MERGE (n)-[:IN_SUPER {runId:$runId, candidate:'stars'}]->(s)
-            """, Map.of("runId", runId, "thr", degreeThreshold));
+            MERGE (n)-[:IN_SUPER {runId:$r, candidate:'stars'}]->(s)
+            """, Map.of("r", runId, "t", thr));
         createSuperEdges(runId, "stars");
     }
 
-    // -------- Helpers (Inchangés) --------
+    /**
+     * Chains: compute degree into a temporary property, then WCC only on degree==2 nodes.
+     */
+    private void buildChains(String runId, String graphName) {
+        String degProp = "tmp_deg_" + shortId(runId);
+        String compProp = "c_ch_" + shortId(runId);
+
+        // write degree as a real DB property
+        db.executeTransactionally(
+                "CALL gds.degree.write($g, {writeProperty:$p})",
+                Map.of("g", graphName, "p", degProp)
+        );
+
+        // nodeFilter uses DB property written above (property key can't be parameterized inside the string)
+        String wccQuery =
+                "CALL gds.wcc.write($g, {writeProperty:$p, nodeFilter:'n.`" + degProp + "` = 2'})";
+        db.executeTransactionally(wccQuery, Map.of("g", graphName, "p", compProp));
+
+        buildSuperNodesFromProperty(runId, "chains", compProp);
+        createSuperEdges(runId, "chains");
+
+        removePropEverywhere(compProp);
+        removePropEverywhere(degProp);
+    }
+
+    // -------- Helpers --------
 
     private void buildSuperNodesFromProperty(String runId, String cand, String prop) {
-        db.executeTransactionally("""
-            MATCH (n)
-            WITH n[$prop] AS gid, collect(n) AS nodes
-            WHERE gid IS NOT NULL
-            CREATE (s:SuperNode {runId:$runId, candidate:$cand, groupId:toString(gid), size:size(nodes)})
-            WITH s, nodes
-            UNWIND nodes AS n
-            MERGE (n)-[:IN_SUPER {runId:$runId, candidate:$cand}]->(s)
-            """, Map.of("runId", runId, "cand", cand, "prop", prop));
+        String q =
+                "MATCH (n) WHERE n.`" + prop + "` IS NOT NULL " +
+                        "WITH n.`" + prop + "` AS gid, collect(n) AS nodes " +
+                        "CREATE (s:SuperNode {runId:$r, candidate:$c, groupId:toString(gid), size:size(nodes)}) " +
+                        "WITH s, nodes UNWIND nodes AS n " +
+                        "MERGE (n)-[:IN_SUPER {runId:$r, candidate:$c}]->(s)";
+        db.executeTransactionally(q, Map.of("r", runId, "c", cand));
+    }
+
+    private void addSingletonsForUncovered(String runId, String cand) {
+        db.executeTransactionally(
+                "MATCH (n) " +
+                        "WHERE NOT (n)-[:IN_SUPER {runId:$r, candidate:$c}]->() " +
+                        "CREATE (s:SuperNode {runId:$r, candidate:$c, groupId:elementId(n), size:1}) " +
+                        "MERGE (n)-[:IN_SUPER {runId:$r, candidate:$c}]->(s)",
+                Map.of("r", runId, "c", cand)
+        );
     }
 
     private void createSuperEdges(String runId, String cand) {
-        db.executeTransactionally("""
-            MATCH (a)-[r]->(b)
-            MATCH (a)-[:IN_SUPER {runId:$runId, candidate:$cand}]->(sa)
-            MATCH (b)-[:IN_SUPER {runId:$runId, candidate:$cand}]->(sb)
-            WHERE sa <> sb
-            MERGE (sa)-[e:SUPER_EDGE {runId:$runId, candidate:$cand}]->(sb)
-            ON CREATE SET e.weight = 1
-            ON MATCH  SET e.weight = e.weight + 1
-            """, Map.of("runId", runId, "cand", cand));
+        db.executeTransactionally(
+                "MATCH (a)-[rel]->(b) " +
+                        "MATCH (a)-[:IN_SUPER {runId:$rid, candidate:$can}]->(sa) " +
+                        "MATCH (b)-[:IN_SUPER {runId:$rid, candidate:$can}]->(sb) " +
+                        "WHERE sa <> sb " +
+                        "MERGE (sa)-[e:SUPER_EDGE {runId:$rid, candidate:$can}]->(sb) " +
+                        "ON CREATE SET e.weight=1 " +
+                        "ON MATCH SET e.weight=e.weight+1",
+                Map.of("rid", runId, "can", cand)
+        );
+    }
+
+    private void removePropEverywhere(String prop) {
+        String q = "MATCH (n) WHERE n.`" + prop + "` IS NOT NULL REMOVE n.`" + prop + "`";
+        db.executeTransactionally(q);
     }
 
     private void cleanupCandidate(String runId, String cand) {
-        db.executeTransactionally("MATCH (s:SuperNode {runId:$runId, candidate:$cand}) DETACH DELETE s", Map.of("runId", runId, "cand", cand));
+        db.executeTransactionally(
+                "MATCH (s:SuperNode {runId:$r, candidate:$c}) DETACH DELETE s",
+                Map.of("r", runId, "c", cand)
+        );
     }
 
     private void cleanupKeepBest(String runId, String best) {
-        db.executeTransactionally("MATCH (s:SuperNode {runId:$runId}) WHERE s.candidate <> $best DETACH DELETE s", Map.of("runId", runId, "best", best));
-        db.executeTransactionally("MATCH ()-[e:SUPER_EDGE {runId:$runId}]->() WHERE e.candidate <> $best DELETE e", Map.of("runId", runId, "best", best));
+        db.executeTransactionally(
+                "MATCH (s:SuperNode {runId:$r}) WHERE s.candidate <> $b DETACH DELETE s",
+                Map.of("r", runId, "b", best)
+        );
     }
 
-    private long count(String cypher, Map<String,Object> params) {
-        return (long) db.executeTransactionally(cypher, params, r -> (long) r.next().get("c"));
+    private long count(String q, Map<String,Object> p) {
+        return db.executeTransactionally(q, p, res -> {
+            if (!res.hasNext()) return 0L;
+            Object v = res.next().get("c");
+            if (v == null) return 0L;
+            if (v instanceof Number n) return n.longValue();
+            return Long.parseLong(v.toString());
+        });
     }
 
-    private String shortId(String runId) {
-        return runId.replace("-", "").substring(0, 8);
-    }
-
-    private void safeDropGraph(String graphName) {
-        try {
-            db.executeTransactionally("CALL gds.graph.drop($g)", Map.of("g", graphName));
-        } catch (Exception e) {
-            log.warn("Erreur drop graphe : " + e.getMessage());
-        }
+    private String shortId(String id) {
+        return id.replace("-", "").substring(0, 6);
     }
 }
